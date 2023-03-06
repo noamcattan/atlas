@@ -15,10 +15,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"text/template"
 	"time"
 
+	"ariga.io/atlas/cmd/atlas/internal/cloudapi"
 	"ariga.io/atlas/schemahcl"
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
@@ -46,6 +48,8 @@ var DataSources = []schemahcl.Option{
 	schemahcl.WithDataSource("sql", QuerySrc),
 	schemahcl.WithDataSource("runtimevar", RuntimeVarSrc),
 	schemahcl.WithDataSource("template_dir", TemplateDir),
+	schemahcl.WithDataSource("remote_dir", RemoteDir),
+	schemahcl.WithInitBlock("atlas", AtlasConfig),
 }
 
 // RuntimeVarSrc exposes the gocloud.dev/runtimevar as a schemahcl datasource.
@@ -305,6 +309,101 @@ func TemplateDir(ctx *hcl.EvalContext, block *hclsyntax.Block) (cty.Value, error
 	}), nil
 }
 
+// AtlasConfig is the handler for the "atlas" init block.
+//
+//	atlas {
+//	  cloud {
+//	    token = data.runtimevar.token	// User token.
+//	    url   = var.cloud_url			// Optional URL.
+//	  }
+//	}
+func AtlasConfig(ctx *hcl.EvalContext, block *hclsyntax.Block) (cty.Value, error) {
+	var args struct {
+		Cloud struct {
+			Token string `hcl:"token"`
+			URL   string `hcl:"url,optional"`
+		} `hcl:"cloud,block"`
+	}
+	if diags := gohcl.DecodeBody(block.Body, ctx, &args); diags.HasErrors() {
+		return cty.NilVal, fmt.Errorf("atlas.cloud: decoding body: %v", diags)
+	}
+	cloud := cty.ObjectVal(map[string]cty.Value{
+		"client": cty.CapsuleVal(
+			clientType,
+			cloudapi.New(args.Cloud.URL, args.Cloud.Token),
+		),
+	})
+	av, diags := (&hclsyntax.ScopeTraversalExpr{
+		Traversal: hcl.Traversal{hcl.TraverseRoot{Name: "atlas", SrcRange: block.Range()}},
+	}).Value(ctx)
+	switch {
+	case !diags.HasErrors():
+		m := av.AsValueMap()
+		m["cloud"] = cloud
+		return cty.ObjectVal(m), nil
+	case len(diags) == 1 && diags[0].Summary == "Unknown variable":
+		return cty.ObjectVal(map[string]cty.Value{"cloud": cloud}), nil
+	default:
+		return cty.NilVal, fmt.Errorf("atlas.cloud: getting config: %v", diags)
+	}
+}
+
+var clientType = cty.Capsule("client", reflect.TypeOf(cloudapi.Client{}))
+
+// RemoteDir is a data source that reads a remote migration directory.
+func RemoteDir(ctx *hcl.EvalContext, block *hclsyntax.Block) (cty.Value, error) {
+	var (
+		args struct {
+			Name string  `hcl:"name"`
+			URL  *string `hcl:"url"`
+		}
+		errorf = blockError("data.remote_dir", block)
+	)
+	if diags := gohcl.DecodeBody(block.Body, ctx, &args); diags.HasErrors() {
+		return cty.NilVal, errorf("decoding body: %v", diags)
+	}
+	cv, diags := (&hclsyntax.ScopeTraversalExpr{
+		Traversal: hcl.Traversal{
+			hcl.TraverseRoot{Name: "atlas", SrcRange: block.Range()},
+			hcl.TraverseAttr{Name: "cloud", SrcRange: block.Range()},
+			hcl.TraverseAttr{Name: "client", SrcRange: block.Range()},
+		},
+	}).Value(ctx)
+	if len(diags) == 1 && diags[0].Summary == "Unknown variable" {
+		return cty.NilVal, errorf("missing atlas cloud config")
+	} else if diags.HasErrors() {
+		return cty.NilVal, errorf("getting atlas client: %v", diags)
+	}
+	client := cv.EncapsulatedValue().(*cloudapi.Client)
+	u, err := memdir(client, args.Name)
+	if err != nil {
+		return cty.NilVal, errorf("reading remote dir: %v", err)
+	}
+	return cty.ObjectVal(map[string]cty.Value{
+		"url": cty.StringVal(u),
+	}), nil
+}
+
+func memdir(client *cloudapi.Client, dirName string) (string, error) {
+	dir, err := client.Dir(context.Background(), cloudapi.DirInput{
+		Name: dirName,
+	})
+	if err != nil {
+		return "", err
+	}
+	md := migrate.OpenMemDir(dirName)
+	files, err := dir.Files()
+	if err != nil {
+		return "", err
+	}
+	for _, f := range files {
+		if err := md.WriteFile(f.Name(), f.Bytes()); err != nil {
+			return "", err
+		}
+	}
+	return "mem://" + dirName, nil
+}
+
 func blockError(name string, b *hclsyntax.Block) func(string, ...any) error {
 	return func(format string, args ...any) error {
 		return fmt.Errorf("%s.%s: %w", name, b.Labels[1], fmt.Errorf(format, args...))
@@ -407,6 +506,8 @@ func (l EntLoader) MigrateDiff(ctx context.Context, opts *MigrateDiffOptions) er
 	m, err := entschema.NewMigrate(
 		sql.OpenDB(opts.Dev.Name, opts.Dev.DB),
 		entschema.WithDir(opts.Dir),
+		entschema.WithDropColumn(true),
+		entschema.WithDropIndex(true),
 		entschema.WithErrNoPlan(true),
 		entschema.WithFormatter(dirFormatter(opts.Dir)),
 		entschema.WithGlobalUniqueID(true),

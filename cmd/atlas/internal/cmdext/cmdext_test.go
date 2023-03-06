@@ -6,7 +6,10 @@ package cmdext_test
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -198,4 +201,94 @@ dir = data.template_dir.tenant.url
 	require.Len(t, files, 1)
 	require.Equal(t, "1.sql", files[0].Name())
 	require.Equal(t, "create table a8m.t(c int);", string(files[0].Bytes()))
+}
+
+func TestAtlasConfig(t *testing.T) {
+	var (
+		v struct {
+			Env       string   `spec:"env"`
+			HasClient bool     `spec:"has_client"`
+			CloudKeys []string `spec:"cloud_keys"`
+		}
+		state = schemahcl.New(append(cmdext.DataSources, schemahcl.WithVariables(map[string]cty.Value{
+			"atlas": cty.ObjectVal(map[string]cty.Value{
+				"env": cty.StringVal("dev"),
+			}),
+		}))...)
+	)
+	err := state.EvalBytes([]byte(`
+atlas {
+  cloud {
+    url = "url"
+    token = "token"
+  }
+}
+
+env = atlas.env
+has_client = atlas.cloud != null
+cloud_keys = keys(atlas.cloud)
+`), &v, map[string]cty.Value{})
+	require.NoError(t, err)
+	require.Equal(t, "dev", v.Env)
+	require.True(t, v.HasClient)
+	require.Equal(t, []string{"client"}, v.CloudKeys, "token and url should not be exported")
+}
+
+func TestRemoteDir(t *testing.T) {
+	var (
+		v struct {
+			Dir string `spec:"dir"`
+		}
+		token string
+		state = schemahcl.New(cmdext.DataSources...)
+		srv   = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			token = r.Header.Get("Authorization")
+			d := migrate.MemDir{}
+			if err := d.WriteFile("1.sql", []byte("create table t(c int);")); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			arch, err := migrate.ArchiveDir(&d)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			fmt.Fprintf(w, `{"data":{"dir":{"content":%q}}}`, base64.StdEncoding.EncodeToString(arch))
+		}))
+	)
+	defer srv.Close()
+
+	err := state.EvalBytes([]byte(`
+data "remote_dir" "hello" {
+  name  = "atlas"
+}
+`), &v, map[string]cty.Value{"cloud_url": cty.StringVal(srv.URL)})
+	require.EqualError(t, err, "data.remote_dir.hello: missing atlas cloud config")
+
+	err = state.EvalBytes([]byte(`
+variable "cloud_url" {
+  type = string
+}
+
+atlas {
+  cloud {
+    token = "token"
+    url = var.cloud_url
+  }
+}
+
+data "remote_dir" "hello" {
+  name  = "atlas"
+}
+
+dir = data.remote_dir.hello.url
+`), &v, map[string]cty.Value{"cloud_url": cty.StringVal(srv.URL)})
+	require.NoError(t, err)
+	require.Equal(t, "Bearer token", token)
+
+	md := migrate.OpenMemDir(strings.TrimPrefix(v.Dir, "mem://"))
+	defer md.Close()
+	files, err := md.Files()
+	require.NoError(t, err)
+	require.Len(t, files, 1)
+	require.Equal(t, "1.sql", files[0].Name())
+	require.Equal(t, "create table t(c int);", string(files[0].Bytes()))
 }
